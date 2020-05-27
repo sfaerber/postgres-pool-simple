@@ -4,13 +4,15 @@ pub use tokio_postgres::Row;
 use async_trait::async_trait;
 use std::sync::Arc;
 use arc_swap::ArcSwap;
-use tokio_postgres::{Client, Config as PostgresConfig, NoTls};
+use tokio_postgres::{Client, Config as PostgresConfig, NoTls, Statement};
 use im::OrdMap;
 use std::time::{Instant, Duration};
 use std::future::Future;
 
 use std::task::{Context, Poll, Waker};
 use log::{trace, debug, info, warn, error};
+use std::hash::Hasher;
+
 
 struct ClientLease {
     client_id: u64,
@@ -39,6 +41,7 @@ struct PooledConnection {
     client: Arc<Client>,
     opened: Instant,
     inc_number: u64,
+    prepared_statements: OrdMap<u64, Statement>,
 }
 
 
@@ -98,7 +101,6 @@ impl Pool {
         tokio::spawn(async move {
             match config.postgres_config.connect(NoTls).await {
                 Ok((client, connection)) => {
-
                     let client = Arc::new(client);
 
                     let inc_number: u64 =
@@ -115,6 +117,7 @@ impl Pool {
                                     client,
                                     opened: Instant::now(),
                                     inc_number,
+                                    prepared_statements: OrdMap::new(),
                                 },
                             );
                             inner
@@ -246,7 +249,7 @@ pub type QueryResult = Result<Vec<Row>, PoolError>;
 
 #[async_trait]
 pub trait Queryable {
-    async fn query<'a>(&self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> QueryResult;
+    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult;
     //async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, FlexPgPoolError>;
 }
 
@@ -260,9 +263,18 @@ impl Pool {
 
 #[async_trait]
 impl Queryable for Pool {
-    async fn query<'a>(&self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> QueryResult {
+    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
         //
+        let hash: u64 = {
+            let mut hasher = ahash::AHasher::new_with_keys(4656, 1456);
+            hasher.write(sql.as_bytes());
+            hasher.finish()
+        };
+
+        trace!("running query with hash {}", hash);
+
         let lease = self.lease_client().await?;
+
 
         let stm = lease.client.prepare(sql)
             .await
@@ -275,6 +287,7 @@ impl Queryable for Pool {
         Ok(rows)
     }
 }
+
 
 struct ClientLeaseFuture {
     future_id: u64,
@@ -304,6 +317,7 @@ impl Future for ClientLeaseFuture {
     }
 }
 
+
 impl Transaction {
     async fn commit() -> Result<(), PoolError> {
         unimplemented!()
@@ -313,7 +327,7 @@ impl Transaction {
 
 #[async_trait]
 impl Queryable for Transaction {
-    async fn query<'a>(&self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> QueryResult {
+    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
         unimplemented!()
     }
 }
