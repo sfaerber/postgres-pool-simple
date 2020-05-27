@@ -10,8 +10,13 @@ use std::time::{Instant, Duration};
 use std::future::Future;
 
 use std::task::{Context, Poll, Waker};
-use log::{trace, debug, info, warn, error};
+use log::{trace, debug, error};
 use std::hash::Hasher;
+use async_std::task;
+
+
+mod socket;
+mod connect;
 
 
 struct ClientLease {
@@ -98,8 +103,11 @@ impl Pool {
         let config = pool.config.clone();
         let state = pool.state.clone();
 
-        tokio::spawn(async move {
-            match config.postgres_config.connect(NoTls).await {
+
+        // config.postgres_config.connect(NoTls).await
+
+        task::spawn(async move {
+            match connect::connect_tls(config.postgres_config.clone(), NoTls).await {
                 Ok((client, connection)) => {
                     let client = Arc::new(client);
 
@@ -265,20 +273,41 @@ impl Pool {
 impl Queryable for Pool {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
         //
-        let hash: u64 = {
+        let statement_hash: u64 = {
             let mut hasher = ahash::AHasher::new_with_keys(4656, 1456);
             hasher.write(sql.as_bytes());
             hasher.finish()
         };
 
-        trace!("running query with hash {}", hash);
-
         let lease = self.lease_client().await?;
 
+        let stm = {
+            match self.state.load().working_connections
+                .get(&lease.client_id).iter()
+                .flat_map(|con| con.prepared_statements.get(&statement_hash)).next() {
+                Some(stm) => {
+                    trace!("reusing statement with hash {}", statement_hash);
+                    stm.clone()
+                }
+                None => {
+                    trace!("building statement with hash {}", statement_hash);
 
-        let stm = lease.client.prepare(sql)
-            .await
-            .map_err(|err| PoolError { message: err.to_string() })?;
+                    let stm = lease.client.prepare(sql)
+                        .await
+                        .map_err(|err| PoolError { message: err.to_string() })?;
+
+                    self.state.rcu(|inner| {
+                        let mut inner = (**inner).clone();
+                        if let Some(cl) = inner.working_connections.get_mut(&lease.client_id) {
+                            (*cl).prepared_statements.insert(statement_hash, stm.clone());
+                        }
+                        inner
+                    });
+
+                    stm
+                }
+            }
+        };
 
         let rows = lease.client.query(&stm, params)
             .await
