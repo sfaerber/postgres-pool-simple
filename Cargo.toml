@@ -1,0 +1,19 @@
+[package]
+name = "postgres-pool-simple"
+version = "0.1.0-alpha.0"
+authors = ["sfaerber <faerber.berlin@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "0.2", features = ["full"] }
+tokio-postgres = "0.5"
+futures-timer = "3.0"
+chrono = "0.4"
+postgres-types = "0.1"
+async-trait = "0.1"
+arc-swap = "0.4"
+im = "15.0"
+futures = "0.3"
+log = "0.4"
