@@ -13,6 +13,7 @@ use std::task::{Context, Poll, Waker};
 use log::{trace, debug, error};
 use std::hash::Hasher;
 use async_std::task;
+use futures_timer::Delay;
 
 
 mod socket;
@@ -58,12 +59,18 @@ struct PoolState {
     connection_counter: u64,
     lease_future_counter: u64,
     lease_counter: u64,
+    currently_connecting_count: usize,
 }
 
 
 impl PoolState {
     fn next_idle_connection_id(&self) -> Option<u64> {
         self.idle_connections.iter().map(|(id, _)| *id).next()
+    }
+    fn overall_connection_count(&self) -> usize {
+        self.currently_connecting_count +
+            self.idle_connections.len() +
+            self.working_connections.len()
     }
 }
 
@@ -107,6 +114,11 @@ impl Pool {
         // config.postgres_config.connect(NoTls).await
 
         task::spawn(async move {
+            state.rcu(move |inner| {
+                let mut inner = (**inner).clone();
+                inner.currently_connecting_count += 1;
+                inner
+            });
             match connect::connect_tls(config.postgres_config.clone(), NoTls).await {
                 Ok((client, connection)) => {
                     let client = Arc::new(client);
@@ -118,6 +130,7 @@ impl Pool {
 
                             let inc_number = inner.connection_counter + 1;
                             inner.connection_counter = inc_number;
+                            inner.currently_connecting_count -= 1;
 
                             inner.idle_connections.insert(
                                 inc_number,
@@ -149,6 +162,11 @@ impl Pool {
                     });
                 }
                 Err(err) => {
+                    state.rcu(move |inner| {
+                        let mut inner = (**inner).clone();
+                        inner.currently_connecting_count -= 1;
+                        inner
+                    });
                     error!("could not connect: {}, ", err)
                 }
             }
@@ -234,18 +252,48 @@ impl Pool {
                     connection_counter: 0,
                     lease_future_counter: 0,
                     lease_counter: 0,
+                    currently_connecting_count: 0,
                 }))),
             config: Arc::new(
                 PoolConfig {
                     postgres_config,
-                    min_connection_count: 50,
-                    _max_connection_count: 100,
+                    min_connection_count: 4,
+                    _max_connection_count: 8,
                 }),
         };
 
         for _ in 0..pool.config.min_connection_count {
             Self::add_connection(&pool);
         }
+
+        let moved_config = pool.config.clone();
+        let moved_state = pool.state.clone();
+
+        // task::spawn(async move {
+        //     for _ in 0..moved_config.min_connection_count {
+        //         Self::add_connection(&moved_state, &moved_config);
+        //         Delay::new(Duration::from_millis(50));
+        //     }
+        // });
+
+        // here we start the housekeeper task
+        let cloned_pool = pool.clone();
+
+        task::spawn(async move {
+
+            loop {
+                Delay::new(Duration::from_millis(50)).await;
+
+                let connection_count = {
+                    moved_state.load().overall_connection_count()
+                };
+
+                if connection_count < moved_config.min_connection_count {
+                    debug!("building a new connection because there are to few in pool");
+                    Self::add_connection(&cloned_pool);
+                }
+            }
+        });
 
         Ok(pool)
     }
