@@ -72,6 +72,14 @@ impl PoolState {
             self.idle_connections.len() +
             self.working_connections.len()
     }
+    fn longest_waiting_lease_waker(&self) -> Option<u64> {
+        self.waiting_lease_futures
+            .iter()
+            .rev()
+            .filter(|(_, (wo, _))| wo.is_some())
+            .map(|(id, _)|*id)
+            .next()
+    }
 }
 
 
@@ -207,10 +215,23 @@ impl Pool {
 
     fn try_wake_waiting(state: &Arc<ArcSwap<PoolState>>) {
         trace!("waking lease futures, count={}", state.load().waiting_lease_futures.len());
-        for waker in state.load().waiting_lease_futures
-            .iter().rev().flat_map(|(_, (wo, _))| wo).next() {
-            waker.wake_by_ref();
-            trace!("waked the longest waiting waker");
+
+        if state.load().longest_waiting_lease_waker().is_none() {
+            return;
+        }
+
+        let last_state =
+            state.rcu(|s| {
+                let mut inner = (**s).clone();
+                if let Some(id) = inner.longest_waiting_lease_waker() {
+                    inner.waiting_lease_futures[&id].0 = None;
+                }
+                inner
+            });
+
+        if let Some(id) = last_state.longest_waiting_lease_waker() {
+            last_state.waiting_lease_futures[&id].0.as_ref().unwrap().wake_by_ref();
+            trace!("waked the longest waiting waker {}", id);
         }
     }
 
@@ -257,8 +278,8 @@ impl Pool {
             config: Arc::new(
                 PoolConfig {
                     postgres_config,
-                    min_connection_count: 4,
-                    _max_connection_count: 8,
+                    min_connection_count: 50,
+                    _max_connection_count: 100,
                 }),
         };
 
