@@ -13,7 +13,6 @@ use std::task::{Context, Poll, Waker};
 use log::{trace, debug, error};
 use std::hash::Hasher;
 use async_std::task;
-use futures_timer::Delay;
 
 
 mod socket;
@@ -31,8 +30,10 @@ impl Drop for ClientLease {
     fn drop(&mut self) {
         self.state.rcu(|inner| {
             let mut inner = (**inner).clone();
-            let con = inner.working_connections.remove(&self.client_id).unwrap();
-            inner.idle_connections.insert(self.client_id, con);
+            // connection may be remove while being leased
+            if let Some(con) = inner.working_connections.remove(&self.client_id) {
+                inner.idle_connections.insert(self.client_id, con);
+            }
             inner
         });
 
@@ -77,7 +78,7 @@ impl PoolState {
             .iter()
             .rev()
             .filter(|(_, (wo, _))| wo.is_some())
-            .map(|(id, _)|*id)
+            .map(|(id, _)| *id)
             .next()
     }
 }
@@ -163,8 +164,12 @@ impl Pool {
                     state.rcu(move |inner| {
                         let mut inner = (**inner).clone();
                         if inner.idle_connections.remove(&inc_number).is_none() {
-                            // TODO: what if the connection is working?
-                            error!("illegal state");
+                            if inner.working_connections.remove(&inc_number).is_none() {
+                                error!(
+                                    "could not find client for terminated connection {}",
+                                    inc_number
+                                );
+                            }
                         }
                         inner
                     });
@@ -287,8 +292,8 @@ impl Pool {
             Self::add_connection(&pool);
         }
 
-        let moved_config = pool.config.clone();
-        let moved_state = pool.state.clone();
+        //let moved_config = pool.config.clone();
+        //let moved_state = pool.state.clone();
 
         // task::spawn(async move {
         //     for _ in 0..moved_config.min_connection_count {
@@ -301,15 +306,24 @@ impl Pool {
         let cloned_pool = pool.clone();
 
         task::spawn(async move {
-
             loop {
-                Delay::new(Duration::from_millis(50)).await;
 
-                let connection_count = {
-                    moved_state.load().overall_connection_count()
-                };
+                task::sleep(Duration::from_millis(250)).await;
 
-                if connection_count < moved_config.min_connection_count {
+                let state = cloned_pool.state.load();
+
+                let connection_count = state.overall_connection_count();
+
+                trace!(
+                    "house keeper: waiting: {}, connections: {}, longest waiting: {:?}",
+                    state.waiting_lease_futures.len(),
+                    state.overall_connection_count(),
+                    state.longest_waiting_lease_waker(),
+                );
+
+                drop(state);
+
+                if connection_count < cloned_pool.config.min_connection_count {
                     debug!("building a new connection because there are to few in pool");
                     Self::add_connection(&cloned_pool);
                 }
@@ -405,12 +419,26 @@ impl Future for ClientLeaseFuture {
                     if let Some((waker, _)) = inner.waiting_lease_futures.get_mut(&self.future_id) {
                         *waker = Some(ctx.waker().clone());
                     } else {
-                        panic!("illegal state")
+                        error!("illegal state: waker not found")
                     }
                     inner
                 });
                 Poll::Pending
             }
+        }
+    }
+}
+
+
+impl Drop for ClientLeaseFuture {
+    fn drop(&mut self) {
+        if self.pool_state.load().waiting_lease_futures.contains_key(&self.future_id) {
+            trace!("future {} was dropped while still in wait list", self.future_id);
+            self.pool_state.rcu(|s| {
+                let mut s = (**s).clone();
+                s.waiting_lease_futures.remove(&self.future_id);
+                s
+            });
         }
     }
 }
