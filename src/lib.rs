@@ -26,6 +26,43 @@ struct ClientLease {
 }
 
 
+impl ClientLease {
+    async fn get_or_create_statement(&self, sql: &str) -> Result<Statement, PoolError> {
+        let statement_hash: u64 = {
+            let mut hasher = ahash::AHasher::new_with_keys(4656, 1456);
+            hasher.write(sql.as_bytes());
+            hasher.finish()
+        };
+
+        match self.state.load().working_connections
+            .get(&self.client_id).iter()
+            .flat_map(|con| con.prepared_statements.get(&statement_hash)).next() {
+            Some(stm) => {
+                trace!("reusing statement with hash {}", statement_hash);
+                Ok(stm.clone())
+            }
+            None => {
+                trace!("building statement with hash {}", statement_hash);
+
+                let stm = self.client.prepare(sql)
+                    .await
+                    .map_err(|err| PoolError { message: err.to_string() })?;
+
+                self.state.rcu(|inner| {
+                    let mut inner = (**inner).clone();
+                    if let Some(cl) = inner.working_connections.get_mut(&self.client_id) {
+                        (*cl).prepared_statements.insert(statement_hash, stm.clone());
+                    }
+                    inner
+                });
+
+                Ok(stm)
+            }
+        }
+    }
+}
+
+
 impl Drop for ClientLease {
     fn drop(&mut self) {
         self.state.rcu(|inner| {
@@ -53,14 +90,23 @@ struct PooledConnection {
 
 
 #[derive(Clone)]
+struct TransactionData {
+    created: Instant,
+    client_id: u64,
+}
+
+
+#[derive(Clone)]
 struct PoolState {
     idle_connections: OrdMap<u64, PooledConnection>,
     working_connections: OrdMap<u64, PooledConnection>,
     waiting_lease_futures: OrdMap<u64, (Option<Waker>, Instant)>,
+    transactions: OrdMap<u64, TransactionData>,
     connection_counter: u64,
     lease_future_counter: u64,
     lease_counter: u64,
     currently_connecting_count: usize,
+    transactions_counter: u64,
 }
 
 
@@ -181,9 +227,6 @@ impl PoolConfig {
         }
     }
 }
-
-
-pub struct Transaction {}
 
 
 impl Pool {
@@ -339,10 +382,12 @@ impl Pool {
                     idle_connections: OrdMap::new(),
                     working_connections: OrdMap::new(),
                     waiting_lease_futures: OrdMap::new(),
+                    transactions: OrdMap::new(),
                     connection_counter: 0,
                     lease_future_counter: 0,
                     lease_counter: 0,
                     currently_connecting_count: 0,
+                    transactions_counter: 0,
                 }))),
             config: Arc::new(config),
         };
@@ -436,13 +481,39 @@ pub type QueryResult = Result<Vec<Row>, PoolError>;
 #[async_trait]
 pub trait Queryable {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult;
-    //async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, FlexPgPoolError>;
+
+    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError>;
 }
 
 
 impl Pool {
-    pub async fn transaction() -> Transaction {
-        unimplemented!()
+    pub async fn transaction(&self) -> Result<Transaction, PoolError> {
+        let client = self.lease_client().await?;
+
+        let begin = client.get_or_create_statement("BEGIN").await?;
+
+        client.client.execute(&begin, &[]).await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+
+        let created = Instant::now();
+
+        let transaction_id =
+            self.state.rcu(|inner| {
+                let mut inner = (**inner).clone();
+                let transaction_id = inner.transactions_counter + 1;
+                inner.transactions_counter = transaction_id;
+                inner.transactions.insert(transaction_id, TransactionData {
+                    created,
+                    client_id: client.client_id,
+                });
+                inner
+            }).transactions_counter + 1;
+
+
+        Ok(Transaction {
+            client_lease: Arc::new(client),
+            transaction_id,
+        })
     }
 }
 
@@ -450,48 +521,27 @@ impl Pool {
 #[async_trait]
 impl Queryable for Pool {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
-        //
-        let statement_hash: u64 = {
-            let mut hasher = ahash::AHasher::new_with_keys(4656, 1456);
-            hasher.write(sql.as_bytes());
-            hasher.finish()
-        };
-
         let lease = self.lease_client().await?;
 
-        let stm = {
-            match self.state.load().working_connections
-                .get(&lease.client_id).iter()
-                .flat_map(|con| con.prepared_statements.get(&statement_hash)).next() {
-                Some(stm) => {
-                    trace!("reusing statement with hash {}", statement_hash);
-                    stm.clone()
-                }
-                None => {
-                    trace!("building statement with hash {}", statement_hash);
-
-                    let stm = lease.client.prepare(sql)
-                        .await
-                        .map_err(|err| PoolError { message: err.to_string() })?;
-
-                    self.state.rcu(|inner| {
-                        let mut inner = (**inner).clone();
-                        if let Some(cl) = inner.working_connections.get_mut(&lease.client_id) {
-                            (*cl).prepared_statements.insert(statement_hash, stm.clone());
-                        }
-                        inner
-                    });
-
-                    stm
-                }
-            }
-        };
+        let stm = lease.get_or_create_statement(&sql).await?;
 
         let rows = lease.client.query(&stm, params)
             .await
             .map_err(|err| PoolError { message: err.to_string() })?;
 
         Ok(rows)
+    }
+
+    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError> {
+        let lease = self.lease_client().await?;
+
+        let stm = lease.get_or_create_statement(&sql).await?;
+
+        let row_count = lease.client.execute(&stm, params)
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+
+        Ok(row_count)
     }
 }
 
@@ -544,9 +594,70 @@ impl Drop for ClientLeaseFuture {
 }
 
 
+pub struct Transaction {
+    client_lease: Arc<ClientLease>,
+    transaction_id: u64,
+}
+
+
 impl Transaction {
-    async fn commit() -> Result<(), PoolError> {
-        unimplemented!()
+    fn done(&self) {
+        warn!("transaction done");
+        self.client_lease.state.rcu(|s| {
+            let mut s = (**s).clone();
+            s.transactions.remove(&self.transaction_id).unwrap();
+            s
+        });
+    }
+
+    pub async fn commit(self) -> Result<(), PoolError> {
+        let stm = self.client_lease.get_or_create_statement("COMMIT").await?;
+        self.client_lease.client.execute(&stm, &[])
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+        debug!("transaction committed");
+        self.done();
+        Ok(())
+    }
+
+    pub async fn rollback(self) -> Result<(), PoolError> {
+        let stm = self.client_lease.get_or_create_statement("ROLLBACK").await?;
+        self.client_lease.client.execute(&stm, &[])
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+        debug!("transaction manually rolled back");
+        self.done();
+        Ok(())
+    }
+}
+
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.client_lease.state.load().transactions.contains_key(&self.transaction_id) {
+            debug!("auto rolling back undone transaction");
+            self.done();
+            let lease = self.client_lease.clone();
+            let transaction_id = self.transaction_id;
+            task::spawn(async move {
+                let log_error = |err: String| {
+                    error!(
+                        "error while rolling back dropped transaction {}: {}",
+                        transaction_id, err
+                    );
+                };
+
+                match lease.get_or_create_statement("ROLLBACK").await {
+                    Ok(stm) =>
+                        if let Err(err) = lease.client.execute(&stm, &[]).await {
+                            log_error(err.to_string());
+                        }else {
+                            debug!("auto rollback done");
+                        },
+                    Err(err) => log_error(err.to_string()),
+                }
+            });
+        }
     }
 }
 
@@ -554,6 +665,22 @@ impl Transaction {
 #[async_trait]
 impl Queryable for Transaction {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
-        unimplemented!()
+        let stm = self.client_lease.get_or_create_statement(&sql).await?;
+
+        let rows = self.client_lease.client.query(&stm, params)
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+
+        Ok(rows)
+    }
+
+    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError> {
+        let stm = self.client_lease.get_or_create_statement(&sql).await?;
+
+        let row_count = self.client_lease.client.execute(&stm, params)
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+
+        Ok(row_count)
     }
 }
