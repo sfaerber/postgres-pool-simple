@@ -1,5 +1,5 @@
 pub use postgres_types::{ToSql, FromSql};
-pub use tokio_postgres::Row;
+pub use tokio_postgres::{Row, Error as TokioError};
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::time::{Instant, Duration};
 use std::future::Future;
 
 use std::task::{Context, Poll, Waker};
-use log::{trace, debug, error};
+use log::{trace, debug, error, warn};
 use std::hash::Hasher;
 use async_std::task;
 
@@ -81,6 +81,13 @@ impl PoolState {
             .map(|(id, _)| *id)
             .next()
     }
+    fn timed_out_leases(&self, timed_out_when_started_before: Instant) -> Vec<u64> {
+        self.waiting_lease_futures
+            .iter()
+            .filter(|(_, (_, t))| t < &timed_out_when_started_before)
+            .map(|(id, _)| *id)
+            .collect()
+    }
 }
 
 
@@ -104,10 +111,75 @@ pub struct Pool {
 }
 
 
+#[derive(Clone)]
 pub struct PoolConfig {
     postgres_config: PostgresConfig,
-    min_connection_count: usize,
-    _max_connection_count: usize,
+    connection_count: usize,
+    house_keeper_interval: Duration,
+    lease_timeout: Duration,
+    max_queue_size: usize,
+}
+
+
+impl PoolConfig {
+    pub fn from_config(postgres_config: PostgresConfig) -> Self {
+        PoolConfig {
+            postgres_config,
+            connection_count: 10,
+            house_keeper_interval: Duration::from_millis(250),
+            lease_timeout: Duration::from_secs(10),
+            max_queue_size: 25_000,
+        }
+    }
+    pub fn from_connection_string(postgres_config: &str) -> Result<Self, TokioError> {
+        Ok(Self::from_config(postgres_config.parse::<PostgresConfig>()?))
+    }
+    pub fn start_pool(&self) -> Result<Pool, PoolError> {
+        let mut cfg = self.clone();
+
+        if cfg.postgres_config.get_connect_timeout().is_none() {
+            cfg.postgres_config.connect_timeout(cfg.lease_timeout);
+            warn!(
+                "'connect_timeout' in postgres was None, 'lease_timeout' of {} sec will be used",
+                cfg.lease_timeout.as_secs_f32(),
+            );
+        }
+
+        if cfg.connection_count == 0 || cfg.connection_count > 1000 {
+            Err(PoolError {
+                message: format!(
+                    "'connection_count' must be between 1 and 1000, got {}",
+                    cfg.connection_count,
+                )
+            })
+        } else if cfg.house_keeper_interval.as_millis() < 10 ||
+            cfg.house_keeper_interval.as_millis() > 10_000 {
+            Err(PoolError {
+                message: format!(
+                    "'house_keeper_interval' must be between 10 and 10_000 ms, got {} ms",
+                    cfg.house_keeper_interval.as_millis(),
+                )
+            })
+        } else if cfg.max_queue_size == 0 || cfg.max_queue_size > 25_000 {
+            Err(PoolError {
+                message: format!(
+                    "'max_queue_size' must be between 1 and 25_000, got {}",
+                    cfg.max_queue_size
+                )
+            })
+        } else if cfg.lease_timeout <= (cfg.house_keeper_interval * 2) {
+            Err(PoolError {
+                message: format!(
+                    "{}, got {}ms <= ({}ms * 2)",
+                    "required 'lease_timeout' > ('house_keeper_interval' * 2)",
+                    cfg.lease_timeout.as_millis(),
+                    cfg.house_keeper_interval.as_millis(),
+                )
+            })
+        } else {
+            Ok(Pool::start(cfg))
+        }
+    }
 }
 
 
@@ -118,9 +190,6 @@ impl Pool {
     fn add_connection(pool: &Self) {
         let config = pool.config.clone();
         let state = pool.state.clone();
-
-
-        // config.postgres_config.connect(NoTls).await
 
         task::spawn(async move {
             state.rcu(move |inner| {
@@ -262,13 +331,8 @@ impl Pool {
         }.await
     }
 
-    pub fn new(postgres_config: &str) -> Result<Self, PoolError> {
+    fn start(config: PoolConfig) -> Self {
         //
-        let mut postgres_config = postgres_config.parse::<PostgresConfig>()
-            .map_err(|err| PoolError { message: err.to_string() })?;
-
-        postgres_config.connect_timeout(Duration::from_secs(5));
-
         let pool = Pool {
             state: Arc::new(ArcSwap::new(Arc::new(
                 PoolState {
@@ -280,57 +344,88 @@ impl Pool {
                     lease_counter: 0,
                     currently_connecting_count: 0,
                 }))),
-            config: Arc::new(
-                PoolConfig {
-                    postgres_config,
-                    min_connection_count: 50,
-                    _max_connection_count: 100,
-                }),
+            config: Arc::new(config),
         };
 
-        for _ in 0..pool.config.min_connection_count {
+        for _ in 0..pool.config.connection_count {
             Self::add_connection(&pool);
         }
 
-        //let moved_config = pool.config.clone();
-        //let moved_state = pool.state.clone();
+        let cloned_pool = pool.clone();
 
-        // task::spawn(async move {
-        //     for _ in 0..moved_config.min_connection_count {
-        //         Self::add_connection(&moved_state, &moved_config);
-        //         Delay::new(Duration::from_millis(50));
-        //     }
-        // });
+        // here we start the initial pool of connections
+        task::spawn(async move {
+            for _ in 0..cloned_pool.config.connection_count {
+                Self::add_connection(&cloned_pool);
+                task::sleep(
+                    cloned_pool.config.house_keeper_interval /
+                        (cloned_pool.config.connection_count as u32 + 1)
+                ).await;
+            }
+        });
 
         // here we start the housekeeper task
         let cloned_pool = pool.clone();
 
         task::spawn(async move {
             loop {
-
-                task::sleep(Duration::from_millis(250)).await;
-
-                let state = cloned_pool.state.load();
-
-                let connection_count = state.overall_connection_count();
-
-                trace!(
-                    "house keeper: waiting: {}, connections: {}, longest waiting: {:?}",
-                    state.waiting_lease_futures.len(),
-                    state.overall_connection_count(),
-                    state.longest_waiting_lease_waker(),
-                );
-
-                drop(state);
-
-                if connection_count < cloned_pool.config.min_connection_count {
-                    debug!("building a new connection because there are to few in pool");
-                    Self::add_connection(&cloned_pool);
-                }
+                task::sleep(cloned_pool.config.house_keeper_interval).await;
+                cloned_pool.do_house_keeping();
             }
         });
 
-        Ok(pool)
+        pool
+    }
+
+    fn do_house_keeping(&self) {
+        //
+        let timed_out_when_started_before = Instant::now() - self.config.lease_timeout;
+
+        let (waiting_count, connection_count, longest_waiting_lease_waker, timeout_count) = {
+            let state = self.state.load();
+            (
+                state.waiting_lease_futures.len(),
+                state.overall_connection_count(),
+                state.longest_waiting_lease_waker(),
+                state.waiting_lease_futures.iter()
+                    .filter(|(_, (_, t))| t < &timed_out_when_started_before)
+                    .count()
+            )
+        };
+
+        trace!(
+            "house keeper: waiting: {}, connections: {}, longest waiting id: {:?}, timed_out: {}",
+            waiting_count,
+            connection_count,
+            longest_waiting_lease_waker,
+            timeout_count
+        );
+
+        if timeout_count > 0 {
+            let old_state =
+                self.state.rcu(|s| {
+                    let mut s = (**s).clone();
+                    for id in s.timed_out_leases(timed_out_when_started_before) {
+                        s.waiting_lease_futures.remove(&id);
+                    }
+                    s
+                });
+
+            let timed_out = old_state.timed_out_leases(timed_out_when_started_before);
+
+            debug!("{} timed out lease futures are removed from pool", timed_out.len());
+
+            for id in timed_out {
+                if let Some(waker) = &old_state.waiting_lease_futures[&id].0 {
+                    waker.wake_by_ref()
+                }
+            }
+        }
+
+        if connection_count < self.config.connection_count {
+            debug!("building a new connection because there are to few in pool");
+            Self::add_connection(&self);
+        }
     }
 }
 
@@ -414,16 +509,21 @@ impl Future for ClientLeaseFuture {
         match Pool::try_lease(&self.pool_state, Some(self.future_id)) {
             Some(lease) => Poll::Ready(Ok(lease)),
             None => {
-                self.pool_state.rcu(|inner| {
+                if self.pool_state.rcu(|inner| {
                     let mut inner = (**inner).clone();
                     if let Some((waker, _)) = inner.waiting_lease_futures.get_mut(&self.future_id) {
                         *waker = Some(ctx.waker().clone());
-                    } else {
-                        error!("illegal state: waker not found")
                     }
                     inner
-                });
-                Poll::Pending
+                }).waiting_lease_futures.contains_key(&self.future_id) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Err(PoolError {
+                        message: format!(
+                            "unable to allocate a database connection within 'lease_timeout'",
+                        )
+                    }))
+                }
             }
         }
     }
