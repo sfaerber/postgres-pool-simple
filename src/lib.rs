@@ -97,9 +97,9 @@ pub struct PoolError {
 }
 
 
-impl ToString for PoolError {
-    fn to_string(&self) -> String {
-        self.message.clone()
+impl std::fmt::Display for PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.message)
     }
 }
 
