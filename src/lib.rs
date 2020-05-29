@@ -266,7 +266,7 @@ impl Pool {
                         inner.working_connections.insert(id, con);
                         inner.lease_counter += 1;
                         if let Some(wait_id) = wait_id {
-                            inner.waiting_lease_futures.remove(&wait_id).unwrap();
+                            inner.waiting_lease_futures.remove(&wait_id);
                         }
                     }
                     inner
