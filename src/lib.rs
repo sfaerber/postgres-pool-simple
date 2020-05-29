@@ -602,7 +602,7 @@ pub struct Transaction {
 
 impl Transaction {
     fn done(&self) {
-        warn!("transaction done");
+        trace!("removing transaction from state");
         self.client_lease.state.rcu(|s| {
             let mut s = (**s).clone();
             s.transactions.remove(&self.transaction_id).unwrap();
