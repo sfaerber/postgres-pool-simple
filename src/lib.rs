@@ -164,7 +164,7 @@ pub struct PoolConfig {
     house_keeper_interval: Duration,
     lease_timeout: Duration,
     max_queue_size: usize,
-    execute_on_connect: Vec<String>,
+    execute_on_connect: String,
 }
 
 
@@ -176,7 +176,7 @@ impl PoolConfig {
             house_keeper_interval: Duration::from_millis(250),
             lease_timeout: Duration::from_secs(10),
             max_queue_size: 5_000,
-            execute_on_connect: vec![],
+            execute_on_connect: "".to_string(),
         }
     }
     pub fn from_connection_string(postgres_config: &str) -> Result<Self, TokioError> {
@@ -249,8 +249,9 @@ impl PoolConfig {
         self
     }
 
-    pub fn execute_on_connect(&mut self, execute_on_connect: String) -> &mut Self {
-        self.execute_on_connect.push(execute_on_connect);
+    pub fn execute_on_connect(&mut self, execute_on_connect: &str) -> &mut Self {
+        self.execute_on_connect += execute_on_connect;
+        self.execute_on_connect += "; ";
         self
     }
 }
@@ -270,6 +271,20 @@ impl Pool {
             match connect::connect_tls(config.postgres_config.clone(), NoTls).await {
                 Ok((client, connection)) => {
                     let client = Arc::new(client);
+
+                    if config.execute_on_connect.len() > 0 {
+                        let client = client.clone();
+                        task::spawn(async move {
+                            if let Err(err) = client.batch_execute(
+                                &config.execute_on_connect).await {
+                                error!(
+                                    "could execute '{}' configured to run on connection create: {}",
+                                    config.execute_on_connect,
+                                    err
+                                );
+                            }
+                        });
+                    }
 
                     let inc_number: u64 =
                         state.rcu(move |inner| {
