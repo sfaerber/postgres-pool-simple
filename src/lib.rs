@@ -164,6 +164,7 @@ pub struct PoolConfig {
     house_keeper_interval: Duration,
     lease_timeout: Duration,
     max_queue_size: usize,
+    execute_on_connect: Vec<String>,
 }
 
 
@@ -174,7 +175,8 @@ impl PoolConfig {
             connection_count: 10,
             house_keeper_interval: Duration::from_millis(250),
             lease_timeout: Duration::from_secs(10),
-            max_queue_size: 25_000,
+            max_queue_size: 5_000,
+            execute_on_connect: vec![],
         }
     }
     pub fn from_connection_string(postgres_config: &str) -> Result<Self, TokioError> {
@@ -225,6 +227,31 @@ impl PoolConfig {
         } else {
             Ok(Pool::start(cfg))
         }
+    }
+
+    pub fn connection_count(&mut self, connection_count: usize) -> &mut Self {
+        self.connection_count = connection_count;
+        self
+    }
+
+    pub fn house_keeper_interval(&mut self, house_keeper_interval: Duration) -> &mut Self {
+        self.house_keeper_interval = house_keeper_interval;
+        self
+    }
+
+    pub fn lease_timeout(&mut self, lease_timeout: Duration) -> &mut Self {
+        self.lease_timeout = lease_timeout;
+        self
+    }
+
+    pub fn max_queue_size(&mut self, max_queue_size: usize) -> &mut Self {
+        self.max_queue_size = max_queue_size;
+        self
+    }
+
+    pub fn execute_on_connect(&mut self, execute_on_connect: String) -> &mut Self {
+        self.execute_on_connect.push(execute_on_connect);
+        self
     }
 }
 
@@ -298,9 +325,30 @@ impl Pool {
         });
     }
 
-    fn try_lease(state: &Arc<ArcSwap<PoolState>>, wait_id: Option<u64>) -> Option<ClientLease> {
+    fn try_lease(
+        state: &Arc<ArcSwap<PoolState>>,
+        max_queue_size: usize,
+        wait_id: Option<u64>,
+    ) -> Result<Option<ClientLease>, PoolError> {
+        let (has_idle, queue_full) = {
+            let state = state.load();
+            (
+                state.next_idle_connection_id().is_some(),
+                state.waiting_lease_futures.len() > max_queue_size
+            )
+        };
+
+        if queue_full {
+            return Err(PoolError {
+                message: format!(
+                    "could not get connection: wait queue with limit {} is full",
+                    max_queue_size
+                )
+            });
+        }
+
         trace!("trying to lease a client for wait_id {:?}", wait_id);
-        if state.load().next_idle_connection_id().is_some() {
+        if has_idle {
             let last_state =
                 state.rcu(|inner| {
                     let mut inner = (**inner).clone();
@@ -317,16 +365,16 @@ impl Pool {
 
             if let Some(client_id) = last_state.next_idle_connection_id() {
                 trace!("leased a client for wait_id {:?}", wait_id);
-                Some(ClientLease {
+                Ok(Some(ClientLease {
                     state: state.clone(),
                     client: last_state.idle_connections[&client_id].client.clone(),
                     client_id,
-                })
+                }))
             } else {
-                None
+                Ok(None)
             }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -353,8 +401,10 @@ impl Pool {
     }
 
     async fn lease_client(&self) -> Result<ClientLease, PoolError> {
-        if let Some(lease) = Self::try_lease(&self.state, None) {
-            return Ok(lease);
+        match Self::try_lease(&self.state, self.config.max_queue_size, None) {
+            Ok(Some(lease)) => return Ok(lease),
+            Err(err) => return Err(err),
+            _ => (),
         }
 
         let now = Instant::now();
@@ -371,6 +421,7 @@ impl Pool {
         ClientLeaseFuture {
             future_id,
             pool_state: self.state.clone(),
+            max_queue_size: self.config.max_queue_size,
         }.await
     }
 
@@ -549,6 +600,7 @@ impl Queryable for Pool {
 struct ClientLeaseFuture {
     future_id: u64,
     pool_state: Arc<ArcSwap<PoolState>>,
+    max_queue_size: usize,
 }
 
 
@@ -556,9 +608,9 @@ impl Future for ClientLeaseFuture {
     type Output = Result<ClientLease, PoolError>;
 
     fn poll(self: std::pin::Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pool::try_lease(&self.pool_state, Some(self.future_id)) {
-            Some(lease) => Poll::Ready(Ok(lease)),
-            None => {
+        match Pool::try_lease(&self.pool_state, self.max_queue_size, Some(self.future_id)) {
+            Ok(Some(lease)) => Poll::Ready(Ok(lease)),
+            Ok(None) => {
                 if self.pool_state.rcu(|inner| {
                     let mut inner = (**inner).clone();
                     if let Some((waker, _)) = inner.waiting_lease_futures.get_mut(&self.future_id) {
@@ -575,6 +627,7 @@ impl Future for ClientLeaseFuture {
                     }))
                 }
             }
+            Err(err) => Poll::Ready(Err(err))
         }
     }
 }
@@ -651,7 +704,7 @@ impl Drop for Transaction {
                     Ok(stm) =>
                         if let Err(err) = lease.client.execute(&stm, &[]).await {
                             log_error(err.to_string());
-                        }else {
+                        } else {
                             debug!("auto rollback done");
                         },
                     Err(err) => log_error(err.to_string()),
