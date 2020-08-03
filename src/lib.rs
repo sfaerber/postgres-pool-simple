@@ -544,7 +544,7 @@ impl Pool {
 pub type QueryResult = Result<Vec<Row>, PoolError>;
 
 
-#[async_trait]
+#[async_trait(?Send)]
 pub trait Queryable {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult;
 
@@ -584,7 +584,7 @@ impl Pool {
 }
 
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Queryable for Pool {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
         let lease = self.lease_client().await?;
@@ -730,7 +730,7 @@ impl Drop for Transaction {
 }
 
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Queryable for Transaction {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
         let stm = self.client_lease.get_or_create_statement(&sql).await?;
