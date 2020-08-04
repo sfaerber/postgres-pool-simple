@@ -9,7 +9,6 @@ edition = "2018"
 [dependencies]
 tokio-postgres = "0.5"
 postgres-types = "0.1"
-async-trait = "0.1"
 arc-swap = "0.4"
 im = "15.0"
 futures = "0.3"

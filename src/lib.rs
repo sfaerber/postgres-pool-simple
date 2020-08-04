@@ -1,7 +1,6 @@
 pub use postgres_types::{ToSql, FromSql};
 pub use tokio_postgres::{Row, Error as TokioError};
 
-use async_trait::async_trait;
 use std::sync::Arc;
 use arc_swap::ArcSwap;
 use tokio_postgres::{Client, Config as PostgresConfig, NoTls, Statement};
@@ -11,9 +10,8 @@ use std::future::Future;
 
 use std::task::{Context, Poll, Waker};
 use log::{trace, debug, error, warn};
-use std::hash::Hasher;
+use std::{pin::Pin, hash::Hasher};
 use async_std::task;
-
 
 mod socket;
 mod connect;
@@ -544,11 +542,11 @@ impl Pool {
 pub type QueryResult = Result<Vec<Row>, PoolError>;
 
 
-#[async_trait(?Send)]
 pub trait Queryable : Sync {
-    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult;
 
-    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError>;
+    fn query<'a>(&'a self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> Pin<Box<dyn Future<Output=QueryResult> + Send + 'a>>;
+
+    fn execute<'a>(&'a self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> Pin<Box<dyn Future<Output=Result<u64, PoolError>> + Send + 'a>>;
 }
 
 
@@ -581,12 +579,8 @@ impl Pool {
             transaction_id,
         })
     }
-}
 
-
-#[async_trait(?Send)]
-impl Queryable for Pool {
-    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
+    pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
         let lease = self.lease_client().await?;
 
         let stm = lease.get_or_create_statement(&sql).await?;
@@ -598,7 +592,7 @@ impl Queryable for Pool {
         Ok(rows)
     }
 
-    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError> {
+    pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError> {
         let lease = self.lease_client().await?;
 
         let stm = lease.get_or_create_statement(&sql).await?;
@@ -608,6 +602,22 @@ impl Queryable for Pool {
             .map_err(|err| PoolError { message: err.to_string() })?;
 
         Ok(row_count)
+    }
+}
+
+
+impl Queryable for Pool {
+
+    fn query<'a>(&'a self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> Pin<Box<dyn Future<Output=QueryResult> + Send + 'a>> {
+        Box::pin( async move { 
+            self.query(sql, params).await
+        })
+    }
+
+    fn execute<'a>(&'a self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> Pin<Box<dyn Future<Output=Result<u64, PoolError>> + Send + 'a>> {
+        Box::pin( async move { 
+            self.execute(sql, params).await
+        })
     }
 }
 
@@ -697,6 +707,26 @@ impl Transaction {
         self.done();
         Ok(())
     }
+
+    pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
+        let stm = self.client_lease.get_or_create_statement(&sql).await?;
+
+        let rows = self.client_lease.client.query(&stm, params)
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+
+        Ok(rows)
+    }
+
+    pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError> {
+        let stm = self.client_lease.get_or_create_statement(&sql).await?;
+
+        let row_count = self.client_lease.client.execute(&stm, params)
+            .await
+            .map_err(|err| PoolError { message: err.to_string() })?;
+
+        Ok(row_count)
+    }
 }
 
 
@@ -730,25 +760,17 @@ impl Drop for Transaction {
 }
 
 
-#[async_trait(?Send)]
 impl Queryable for Transaction {
-    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult {
-        let stm = self.client_lease.get_or_create_statement(&sql).await?;
 
-        let rows = self.client_lease.client.query(&stm, params)
-            .await
-            .map_err(|err| PoolError { message: err.to_string() })?;
-
-        Ok(rows)
+    fn query<'a>(&'a self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> Pin<Box<dyn Future<Output=QueryResult> + Send + 'a>> {
+        Box::pin( async move { 
+            self.query(sql, params).await
+        })
     }
 
-    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError> {
-        let stm = self.client_lease.get_or_create_statement(&sql).await?;
-
-        let row_count = self.client_lease.client.execute(&stm, params)
-            .await
-            .map_err(|err| PoolError { message: err.to_string() })?;
-
-        Ok(row_count)
+    fn execute<'a>(&'a self, sql: &'a str, params: &'a [&(dyn ToSql + Sync)]) -> Pin<Box<dyn Future<Output=Result<u64, PoolError>> + Send + 'a>> {
+        Box::pin( async move { 
+            self.execute(sql, params).await
+        })
     }
 }
