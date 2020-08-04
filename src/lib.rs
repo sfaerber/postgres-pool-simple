@@ -545,7 +545,7 @@ pub type QueryResult = Result<Vec<Row>, PoolError>;
 
 
 #[async_trait(?Send)]
-pub trait Queryable {
+pub trait Queryable : Sync {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> QueryResult;
 
     async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, PoolError>;
