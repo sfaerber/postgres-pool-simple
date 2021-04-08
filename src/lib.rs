@@ -456,10 +456,6 @@ impl Pool {
             config: Arc::new(config),
         };
 
-        for _ in 0..pool.config.connection_count {
-            Self::add_connection(&pool);
-        }
-
         let cloned_pool = pool.clone();
 
         // here we start the initial pool of connections
